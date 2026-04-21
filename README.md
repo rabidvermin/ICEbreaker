@@ -8,6 +8,44 @@ ICEbreaker is a cyberpunk-themed network service discovery and vulnerability det
 
 ## Tools
 
+### netsight.py
+Multi-phase network visibility and host discovery automation. Drives nmap through a progressive discovery pipeline — ping sweep, FQDN resolution, dark IP detection, full enumeration, firewall evasion, and source port scanning. Detects anomalous network conditions (honey-pots, tarpits, all-responding networks) and automatically falls back to a safe conservative scan.
+
+**Features:**
+- Six-phase scan pipeline: ping sweep → dark IP discovery → top port enumeration → full 65k scan → evasion scans → source port scans
+- Flat configuration file (`netsight.conf`) with all settings overridable via CLI flags
+- Anomalous network detection — warns loudly and falls back if >N% of hosts respond to ping or >N% of ports appear open
+- Configurable thresholds for anomaly detection (`PING_RESPONSE_THRESHOLD`, `OPEN_PORT_THRESHOLD`)
+- Fallback scan mode for known hostile or honey-pot networks
+- Dry-run mode — prints every nmap command without executing
+- Per-phase toggles: skip full TCP, skip UDP, skip evasion, skip source ports
+- Generates interim output files after phase 3 so follow-on testing can begin while 65k scans run
+- Source port scans across known trusted ports to detect firewall misconfigurations
+- Requires nmap and sudo
+
+**Quick start:**
+```bash
+# Standard run with default config
+python3 netsight.py
+
+# Dry run — see all commands before executing
+python3 netsight.py --dry-run
+
+# Custom targets, skip slow phases
+python3 netsight.py --targets scope.txt --no-full-tcp --no-source-ports
+
+# Run fallback scan only (suspected honey-pot network)
+python3 netsight.py --fallback-only
+
+# Tighten anomaly detection
+python3 netsight.py --ping-threshold 60 --port-threshold 70
+
+# Output to specific directory
+python3 netsight.py --output-dir ./client-results
+```
+
+---
+
 ### port_frequer.py
 Analyzes grepable nmap output (`.gnmap`) and reports open port frequency across all scanned hosts. Useful for quickly identifying the most common services in a large network scan and building targeted port lists for follow-on tooling.
 
@@ -66,6 +104,44 @@ python3 certsiphon.py --starttls smtp --extra-ports 2525 scan.gnmap
 
 ---
 
+### httpsiphon.py
+Detects HTTP and HTTPS services across hosts and ports discovered in nmap scan output. Uses raw TCP sockets with no external dependencies — attempts plain HTTP first, falls back to HTTPS. Extracts status codes, server headers, redirect targets, auth requirements, and optionally page titles.
+
+**Features:**
+- Ingests `.gnmap` and nmap XML (`.xml`) formats
+- Single file, comma-separated list, or glob pattern input
+- Raw socket detection — no external tools required
+- Auto-detects HTTP vs HTTPS per port
+- Extracts status code, Server header, Location, WWW-Authenticate, X-Powered-By
+- Optional page title extraction (`--grab-title`)
+- Security header gap detection (`--missing-headers`)
+- Filter by protocol, status code, or security header flags
+- Output modes: default (one URL per line), comma list, JSON, CSV
+- File export
+
+**Quick start:**
+```bash
+# Default output: one URL per line
+python3 httpsiphon.py scan.gnmap
+
+# Grab page titles
+python3 httpsiphon.py scan.gnmap --grab-title
+
+# HTTPS services only
+python3 httpsiphon.py scan.gnmap --https-only
+
+# Find services missing security headers
+python3 httpsiphon.py scan.gnmap --missing-headers
+
+# Filter to login pages and forbidden responses
+python3 httpsiphon.py scan.gnmap --status 401 403
+
+# Comma-separated URL list for piping into other tools
+python3 httpsiphon.py scan.gnmap -l
+```
+
+---
+
 ## Design Philosophy
 
 ICEbreaker tools are designed to:
@@ -74,6 +150,7 @@ ICEbreaker tools are designed to:
 - **Be pipe-friendly** — output modes designed to chain into other tools.
 - **Stay minimal** — stdlib-first, no heavy dependencies.
 - **Report to stderr, output to stdout** — informational messages never pollute piped output.
+- **Fail loudly** — anomalous conditions produce unmissable warnings, not silent failures.
 
 ---
 
@@ -81,23 +158,29 @@ ICEbreaker tools are designed to:
 
 - Python 3.8+
 - No external dependencies (stdlib only)
-- nmap output files (`.gnmap` or `.xml`) as input
+- nmap installed and available in PATH (`netsight.py` also requires sudo)
+- nmap output files (`.gnmap` or `.xml`) as input for post-processing tools
 
 ---
 
 ## Suggested Workflow
 
 ```
-nmap -sS -p- -oA scan target_range
-         |
-         v
-   port_frequer.py        <- what ports are most common?
-         |
-         v
-   certsiphon.py          <- what domains/orgs are on those services?
-         |
-         v
-   follow-on tooling      <- subdomain enum, vuln scanning, etc.
+          [ targets.txt ]
+                |
+                v
+          netsight.py             <- discover live hosts, enumerate ports
+                |
+        +-------+-------+
+        |               |
+        v               v
+  port_frequer.py   certsiphon.py  <- what ports are common? what domains?
+        |               |
+        v               v
+  httpsiphon.py    follow-on       <- which ports run HTTP/HTTPS?
+        |
+        v
+  follow-on tooling                <- app scanning, vuln detection, etc.
 ```
 
 ---
