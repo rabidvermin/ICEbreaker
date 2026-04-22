@@ -18,6 +18,14 @@ from datetime import datetime, timezone
 from xml.etree import ElementTree
 import glob as glob_module
 
+try:
+    from cryptography import x509 as crypto_x509
+    from cryptography.x509.oid import ExtensionOID
+    from cryptography.x509.extensions import ExtensionNotFound
+    HAS_CRYPTOGRAPHY = True
+except ImportError:
+    HAS_CRYPTOGRAPHY = False
+
 BANNER = r"""
   +------------------------------------------------------------------+
   | 4f:9c SAN:*.io x509 CN:foo.com 3a7 rsa2048 0xff TLS pem SHA256  |
@@ -216,7 +224,8 @@ def connect_and_get_cert(host, port, timeout, starttls_proto=None):
 
         with ctx.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
             result['status'] = 'tls'
-            result['cert'] = tls_sock.getpeercert()
+            result['cert']     = tls_sock.getpeercert()                  # empty with CERT_NONE
+            result['cert_der'] = tls_sock.getpeercert(binary_form=True)  # always populated
 
     except ssl.SSLError as e:
         raw_sock.close()
@@ -314,6 +323,79 @@ def parse_cert(cert_dict):
     return info
 
 
+def parse_cert_der(der_bytes):
+    """
+    Parse a DER-encoded certificate using the cryptography library.
+    Returns the same structured dict as parse_cert().
+    Used when ssl.CERT_NONE is set and getpeercert() returns an empty dict.
+    """
+    info = {
+        'cn':          None,
+        'org':         None,
+        'san_dns':     [],
+        'san_ip':      [],
+        'not_after':   None,
+        'not_before':  None,
+        'self_signed': False,
+        'expired':     False,
+        'near_expiry': False,
+        'wildcard':    False,
+        'fqdns':       [],
+        'slds':        [],
+    }
+
+    cert = crypto_x509.load_der_x509_certificate(der_bytes)
+
+    # CN and Org from subject
+    for attr in cert.subject:
+        oid = attr.oid.dotted_string
+        if oid == '2.5.4.3':
+            info['cn'] = attr.value
+        elif oid == '2.5.4.10':
+            info['org'] = attr.value
+
+    # Self-signed: subject DN == issuer DN
+    info['self_signed'] = cert.subject == cert.issuer
+
+    # SANs
+    try:
+        san_ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+        for name in san_ext.value:
+            type_name = type(name).__name__
+            if type_name == 'DNSName':
+                info['san_dns'].append(name.value)
+            elif type_name == 'IPAddress':
+                info['san_ip'].append(str(name.value))
+    except ExtensionNotFound:
+        pass
+
+    # Validity / expiry
+    try:
+        not_after  = cert.not_valid_after_utc
+        not_before = cert.not_valid_before_utc
+        info['not_after']  = not_after.isoformat()
+        info['not_before'] = not_before.isoformat()
+        now = datetime.now(timezone.utc)
+        info['expired']    = not_after < now
+        info['near_expiry'] = (not info['expired'] and
+                               (not_after - now).days <= NEAR_EXPIRY_DAYS)
+    except Exception:
+        pass
+
+    # FQDNs from SANs + CN
+    candidates = info['san_dns'] + ([info['cn']] if info['cn'] else [])
+    fqdns = set()
+    for val in candidates:
+        if is_fqdn(val):
+            fqdns.add(val)
+            if val.startswith('*.'):
+                info['wildcard'] = True
+
+    info['fqdns'] = sorted(fqdns)
+    info['slds']  = sorted({extract_sld(f) for f in info['fqdns']})
+    return info
+
+
 # ---------------------------------------------------------------------------
 # Scan worker
 # ---------------------------------------------------------------------------
@@ -325,8 +407,12 @@ def scan_target(host, port, timeout, starttls_proto, rate_lock, rate_delay):
 
     result = connect_and_get_cert(host, port, timeout, starttls_proto)
     result['cert_info'] = None
-    if result['status'] == 'tls' and result['cert']:
-        result['cert_info'] = parse_cert(result['cert'])
+    if result['status'] == 'tls':
+        der = result.get('cert_der')
+        if der and HAS_CRYPTOGRAPHY:
+            result['cert_info'] = parse_cert_der(der)
+        elif result.get('cert'):
+            result['cert_info'] = parse_cert(result['cert'])
     return result
 
 
@@ -670,6 +756,11 @@ def main():
         sys.exit(0)
 
     args = parser.parse_args()
+
+    if not HAS_CRYPTOGRAPHY:
+        print('[!] Warning: cryptography library not installed. Cert parsing will be limited.',
+              file=sys.stderr)
+        print('    Install with: pip install cryptography', file=sys.stderr)
 
     # --- Resolve inputs ---
     file_list = resolve_files(args.files)
