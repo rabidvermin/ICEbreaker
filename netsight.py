@@ -3,8 +3,10 @@
 
 import argparse
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -340,8 +342,9 @@ def phase_banner(msg):
     print(f'\n{GREEN}{BOLD}[*] {msg}{RESET}')
 
 
-def run_fallback_scan(cfg, args, outdir, dry_run, verbose):
-    """Run a conservative top-N port scan against all targets as fallback."""
+def run_fallback_scan(cfg, outdir, dry_run, verbose):
+    """Run a conservative top-N port scan against all targets as fallback.
+    Returns (outbase, fallback_ports) for post-scan analysis."""
     fallback_ports = cfg_int(cfg, 'TOPPORTSFALLBACK')
     minrate        = cfg['MINRATE']
     maxrtt         = cfg['MAXRTTTIMEOUT']
@@ -360,6 +363,114 @@ def run_fallback_scan(cfg, args, outdir, dry_run, verbose):
         '-iL', targets,
         '-oA', outbase,
     ], dry_run=dry_run, verbose=verbose)
+    return outbase, fallback_ports
+
+
+def analyze_fallback_scan(gnmap_file, num_targets, fallback_ports, threshold):
+    """
+    Parse fallback gnmap output and check if port response rate exceeds threshold.
+    total possible ports = num_targets × fallback_ports.
+    Returns (should_stop, stats_dict).
+    """
+    hosts_responded = set()
+    total_ports_responding = 0
+
+    try:
+        with open(gnmap_file) as f:
+            for line in f:
+                if not line.startswith('Host:'):
+                    continue
+                opens = re.findall(r'\d+/open/tcp', line)
+                if opens:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        hosts_responded.add(parts[1])
+                    total_ports_responding += len(opens)
+    except FileNotFoundError:
+        pass
+
+    total_possible = num_targets * fallback_ports
+    pct = (total_ports_responding / total_possible * 100) if total_possible > 0 else 0.0
+
+    stats = {
+        'hosts_scanned':     num_targets,
+        'hosts_responded':   len(hosts_responded),
+        'ports_scanned':     total_possible,
+        'ports_responding':  total_ports_responding,
+        'response_pct':      pct,
+        'threshold':         threshold,
+    }
+    return pct >= threshold, stats
+
+
+def print_fallback_stats(stats):
+    """Print fallback scan statistics to stderr."""
+    print(f'\n{GREEN}{BOLD}[*] Fallback scan statistics:{RESET}', file=sys.stderr)
+    print(f'    Hosts scanned    : {stats["hosts_scanned"]}', file=sys.stderr)
+    print(f'    Hosts responded  : {stats["hosts_responded"]}', file=sys.stderr)
+    print(f'    Ports scanned    : {stats["ports_scanned"]}', file=sys.stderr)
+    print(
+        f'    Ports responding : {stats["ports_responding"]} ({stats["response_pct"]:.1f}%)',
+        file=sys.stderr,
+    )
+
+
+def warn_fallback_anomaly(stats, threshold):
+    """Print a red warning block when the fallback scan also exceeds the threshold."""
+    klaxon = '🚨' * 30
+    print(f'\n{RED}{BOLD}', file=sys.stderr)
+    print(f'  {klaxon}', file=sys.stderr)
+    print(WARNING_ART, file=sys.stderr)
+    print(f'  {klaxon}', file=sys.stderr)
+    print(file=sys.stderr)
+    print(f'  !! FALLBACK SCAN ALSO ANOMALOUS — ABORTING !!', file=sys.stderr)
+    print(file=sys.stderr)
+    print(
+        f'  Ports responding : {stats["ports_responding"]} / {stats["ports_scanned"]}'
+        f' ({stats["response_pct"]:.1f}%)',
+        file=sys.stderr,
+    )
+    print(f'  Threshold        : {threshold}%', file=sys.stderr)
+    print(file=sys.stderr)
+    print(f'  Network conditions are unreliable. Investigate before proceeding.', file=sys.stderr)
+    print(file=sys.stderr)
+    print(f'  {klaxon}', file=sys.stderr)
+    print(f'{RESET}\n', file=sys.stderr)
+
+
+def handle_fallback(cfg, outdir, dry_run, verbose):
+    """
+    Run fallback scan, analyze results, and return the all-up host file path,
+    or None if the fallback itself exceeded the anomaly threshold.
+    In dry_run mode skips analysis and returns the expected output path.
+    """
+    outbase, fallback_ports = run_fallback_scan(cfg, outdir, dry_run, verbose)
+    all_up = os.path.join(outdir, 'fallback-all-up.txt')
+
+    if dry_run:
+        return all_up
+
+    num_targets    = count_targets(cfg['TARGETS_FILE'])
+    port_threshold = cfg_int(cfg, 'OPEN_PORT_THRESHOLD')
+    gnmap_file     = outbase + '.gnmap'
+
+    should_stop, stats = analyze_fallback_scan(gnmap_file, num_targets, fallback_ports, port_threshold)
+    print_fallback_stats(stats)
+
+    if should_stop:
+        warn_fallback_anomaly(stats, port_threshold)
+        return None
+
+    print(
+        f'\n{GREEN}[*] Fallback scan within threshold.'
+        f' Continuing to phases 3-6 in 30 seconds ...{RESET}',
+        file=sys.stderr,
+    )
+    time.sleep(30)
+
+    extract_open_hosts(gnmap_file, all_up)
+    print(f'{GREEN}[*] Fallback active hosts written to: {all_up}{RESET}', file=sys.stderr)
+    return all_up
 
 
 def phase1_discovery(cfg, outdir, dry_run, verbose):
@@ -394,13 +505,14 @@ def phase1_discovery(cfg, outdir, dry_run, verbose):
     print(f'[*] Ping sweep: {len(ping_hosts)} hosts responded.', file=sys.stderr)
 
     # --- Honey-pot check: ping ---
-    anomaly, pct = check_ping_anomaly(pings_up, total_targets, ping_threshold)
-    if anomaly:
-        warn_anomaly(
-            'Excessive ping sweep response rate',
-            pct, ping_threshold, fallback_ports
-        )
-        return None  # Signal fallback needed
+    if not dry_run:
+        anomaly, pct = check_ping_anomaly(pings_up, total_targets, ping_threshold)
+        if anomaly:
+            warn_anomaly(
+                'Excessive ping sweep response rate',
+                pct, ping_threshold, fallback_ports
+            )
+            return None  # Signal fallback needed
 
     # Build initial excluded list
     merge_host_files(excluded, pings_up, exclude)
@@ -451,13 +563,14 @@ def phase2_dark_ips(cfg, excluded, outdir, dry_run, verbose):
     print(f'[*] Dark IP scan: {len(dark_hosts)} additional hosts found.', file=sys.stderr)
 
     # --- Honey-pot check: open ports ---
-    anomaly, pct = check_port_anomaly(dark_base + '.gnmap', port_threshold)
-    if anomaly:
-        warn_anomaly(
-            'Excessive open port response rate during dark IP scan',
-            pct, port_threshold, fallback_ports
-        )
-        return None
+    if not dry_run:
+        anomaly, pct = check_port_anomaly(dark_base + '.gnmap', port_threshold)
+        if anomaly:
+            warn_anomaly(
+                'Excessive open port response rate during dark IP scan',
+                pct, port_threshold, fallback_ports
+            )
+            return None
 
     return dark_up
 
@@ -625,6 +738,18 @@ def phase6_source_ports(cfg, targets, outdir, dry_run, verbose):
             '-iL', targets,
             '-oA', os.path.join(sp_dir, f'source-{sport}-top1k-udp'),
         ], dry_run=dry_run, verbose=verbose)
+
+
+# ---------------------------------------------------------------------------
+# Composite helpers
+# ---------------------------------------------------------------------------
+
+def run_phases_3_to_6(cfg, all_up, targets, outdir, dry_run, verbose):
+    """Run phases 3 through 6 against the given all-up host list."""
+    phase3_enumerate(cfg, all_up, outdir, dry_run, verbose)
+    phase4_full_scan(cfg, all_up, outdir, dry_run, verbose)
+    phase5_evasion(cfg, targets, outdir, dry_run, verbose)
+    phase6_source_ports(cfg, targets, outdir, dry_run, verbose)
 
 
 # ---------------------------------------------------------------------------
@@ -855,20 +980,26 @@ def main():
     if args.fallback_only:
         print(f'{YELLOW}[!] --fallback-only specified. Skipping normal phases.{RESET}',
               file=sys.stderr)
-        run_fallback_scan(cfg, args, outdir, dry_run, verbose)
+        fallback_all_up = handle_fallback(cfg, outdir, dry_run, verbose)
+        if fallback_all_up:
+            run_phases_3_to_6(cfg, fallback_all_up, targets, outdir, dry_run, verbose)
         sys.exit(0)
 
     # --- Phase 1: Host discovery ---
     result = phase1_discovery(cfg, outdir, dry_run, verbose)
     if result is None:
-        run_fallback_scan(cfg, args, outdir, dry_run, verbose)
+        fallback_all_up = handle_fallback(cfg, outdir, dry_run, verbose)
+        if fallback_all_up:
+            run_phases_3_to_6(cfg, fallback_all_up, targets, outdir, dry_run, verbose)
         sys.exit(0)
     pings_up, listscan_up, excluded = result
 
     # --- Phase 2: Dark IPs ---
     dark_up = phase2_dark_ips(cfg, excluded, outdir, dry_run, verbose)
     if dark_up is None:
-        run_fallback_scan(cfg, args, outdir, dry_run, verbose)
+        fallback_all_up = handle_fallback(cfg, outdir, dry_run, verbose)
+        if fallback_all_up:
+            run_phases_3_to_6(cfg, fallback_all_up, targets, outdir, dry_run, verbose)
         sys.exit(0)
 
     # Build final all-up.txt

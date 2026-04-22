@@ -1,6 +1,6 @@
 # ICEbreaker
 
-> *"The ice isn't going to break itself."*
+> *"You've seen a lot of cowboy kinos, right? Well, the stuff they make up for those things isn't much, compared with the kind of shit a real heavy operator can front. Particularly when it comes to icebreakers. Heavy icebreakers are kind of funny to deal in, even for the big boys You know why? Because ice, all the really hard stuff, the walls around every major store of data in the matrix, is always the produce of an AI, an ariificial intelligence. Nothing else is fast enough to weave good ice and constantly alter and upgrade it. So when a really powerful icebreaker shows up on the black market, there are already a couple of very dicey factors in play."* Beauvoir from Count Zero
 
 ICEbreaker is a cyberpunk-themed network service discovery and vulnerability detection toolkit built for penetration testers, red teamers, and security researchers. It is designed to work alongside **nmap** — consuming its output formats and extracting actionable intelligence from scan results.
 
@@ -142,6 +142,53 @@ python3 httpsiphon.py scan.gnmap -l
 
 ---
 
+### tlscertinspector.py
+Single-target TLS certificate inspection utility. Connects to a given `host:port`, performs a TLS handshake, and prints a detailed breakdown of the certificate — useful for quickly inspecting a specific service without running a full scan.
+
+**Features:**
+- Single `host:port` target input
+- Full certificate details: subject, issuer, serial number, validity window, expiry countdown
+- Subject Alternative Names (SANs) — DNS and IP
+- OCSP and CA Issuer URLs from the Authority Information Access extension
+- TLS protocol version and cipher suite reported
+- Flags expired certificates clearly
+- Requires `cryptography` library: `pip install cryptography`
+
+**Quick start:**
+```bash
+# Inspect a certificate
+python3 tlscertinspector.py example.com:443
+
+# Non-standard port
+python3 tlscertinspector.py 10.1.2.3:8443
+
+# IPv6
+python3 tlscertinspector.py [::1]:443
+```
+
+**Example output:**
+```
+============================================================
+  TLS Certificate — example.com:443
+============================================================
+  Protocol           TLSv1.3
+  Cipher             TLS_AES_256_GCM_SHA384 (256-bit)
+------------------------------------------------------------
+  Subject            CN=example.com, O=Example Org, C=US
+  Issuer             CN=R11, O=Let's Encrypt, C=US
+  Serial             0x deadbeef...
+------------------------------------------------------------
+  Not Before         2025-01-01 00:00:00 UTC
+  Not After          2025-04-01 00:00:00 UTC (in 90 days)
+------------------------------------------------------------
+  Subject Alt Names:
+    • DNSName:example.com
+    • DNSName:www.example.com
+============================================================
+```
+
+---
+
 ## Design Philosophy
 
 ICEbreaker tools are designed to:
@@ -157,7 +204,7 @@ ICEbreaker tools are designed to:
 ## Requirements
 
 - Python 3.8+
-- No external dependencies (stdlib only)
+- `pip install cryptography` — required by `certsiphon.py` and `tlscertinspector.py`
 - nmap installed and available in PATH (`netsight.py` also requires sudo)
 - nmap output files (`.gnmap` or `.xml`) as input for post-processing tools
 
