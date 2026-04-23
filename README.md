@@ -142,6 +142,47 @@ python3 httpsiphon.py scan.gnmap -l
 
 ---
 
+### faultline.py
+Identifies firewall bypass opportunities by comparing open ports found in netsight phase 6 source port scans against the baseline discovered in earlier phases. Ports that are open only when traffic originates from a trusted source port (e.g., DNS/53, NTP/123, SNMP/161) indicate firewall rules that trust source port over destination port — a common misconfiguration in environments that allow unrestricted traffic from "trusted" services.
+
+Auto-detects the netsight output directory layout: baseline gnmap files in the root, source port scans under `source-port-scan/`.
+
+**Features:**
+- Ingests baseline and source port scan files in gnmap or nmap XML format
+- Auto-detects netsight output layout with no configuration required
+- Single file, comma-separated list, or glob pattern input for both baseline and source files
+- Extracts source port number from netsight-generated filenames (`source-{port}-top1k-syn.gnmap`)
+- Output modes: grouped by host (default), grouped by source port, summary only, JSON, CSV
+- Summary reports: hosts affected, total bypass ports, most/least effective source port
+- File export (`-o`)
+
+**Quick start:**
+```bash
+# Auto-detect from current netsight output directory
+python3 faultline.py
+
+# Specific netsight output directory
+python3 faultline.py -d ./client-results
+
+# Group findings by source port instead of host
+python3 faultline.py --by-source-port
+
+# Summary only
+python3 faultline.py --summary-only
+
+# JSON export
+python3 faultline.py --json -o findings.json
+
+# CSV export
+python3 faultline.py --csv -o findings.csv
+
+# Manual file specification
+python3 faultline.py -b "top10000-allup-syn.gnmap,65k-allresponding-tcp.gnmap" \
+                     -s "source-port-scan/*.gnmap"
+```
+
+---
+
 ### tlscertinspector.py
 Single-target TLS certificate inspection utility. Connects to a given `host:port`, performs a TLS handshake, and prints a detailed breakdown of the certificate — useful for quickly inspecting a specific service without running a full scan.
 
@@ -218,16 +259,16 @@ ICEbreaker tools are designed to:
                 v
           netsight.py             <- discover live hosts, enumerate ports
                 |
-        +-------+-------+
-        |               |
+        +-------+-------+-------+
+        |               |       |
+        v               v       v
+  port_frequer.py  certsiphon  faultline.py  <- port frequency / cert domains /
+        |               |                       firewall bypass findings
         v               v
-  port_frequer.py   certsiphon.py  <- what ports are common? what domains?
-        |               |
-        v               v
-  httpsiphon.py    follow-on       <- which ports run HTTP/HTTPS?
+  httpsiphon.py    follow-on   <- which ports run HTTP/HTTPS?
         |
         v
-  follow-on tooling                <- app scanning, vuln detection, etc.
+  follow-on tooling            <- app scanning, vuln detection, etc.
 ```
 
 ---
